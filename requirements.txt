@@ -1,3 +1,5 @@
 brother_ql
 bottle
 jinja2
+Pillow==9.5.0
+pylibdmtx

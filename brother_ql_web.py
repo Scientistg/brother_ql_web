@@ -29,6 +29,11 @@ except FileNotFoundError as e:
     with open('config.example.json', encoding='utf-8') as fh:
         CONFIG = json.load(fh)
 
+GROCY_PADDING_RIGHT = CONFIG["grocy_label"]["padding_right"]
+GROCY_PADDING_AFTER_DM = CONFIG["grocy_label"]["padding_after_datamatrix"]
+GROCY_PRODUCT_VERTICAL_TWEAK = CONFIG["grocy_label"]["product_vertical_tweak"]
+GROCY_DATE_VERTICAL_GAP = CONFIG["grocy_label"]["date_vertical_gap"]
+
 
 @route('/')
 def index():
@@ -67,7 +72,7 @@ def get_label_context(request):
       'align':         d.get('align', 'center'),
       'orientation':   d.get('orientation', 'standard'),
       'margin_top':    float(d.get('margin_top',    24))/100.,
-      'margin_bottom': float(d.get('margin_bottom', 45))/100.,
+      'margin_bottom': float(d.get('margin_bottom', 25))/100.,
       'margin_left':   float(d.get('margin_left',   35))/100.,
       'margin_right':  float(d.get('margin_right',  35))/100.,
       'grocycode': d.get('grocycode', None),
@@ -119,7 +124,7 @@ def create_label_im(text, **kwargs):
         if line == '': line = ' '
         lines.append(line)
     text = '\n'.join(lines)
-    linesize = im_font.getsize(text)
+    # linesize = im_font.getsize(text)
     textsize = draw.multiline_textsize(text, font=im_font)
     width, height = kwargs['width'], kwargs['height']
     if kwargs['orientation'] == 'standard':
@@ -148,62 +153,101 @@ def create_label_im(text, **kwargs):
     draw.multiline_text(offset, text, kwargs['fill_color'], font=im_font, align=kwargs['align'])
     return im
 
+def autosize_font(text, font_path, max_width, max_height, starting_size):
+    """Automatically shrink font size so the text fits inside max_width/max_height."""
+    size = starting_size
+    while size > 8:  # minimum readable size
+        font = ImageFont.truetype(font_path, size)
+        w, h = font.getsize(text)
+        if w <= max_width and h <= max_height:
+            return font
+        size -= 2
+    return ImageFont.truetype(font_path, 8)
+
 def create_label_grocy(text, **kwargs):
     product = kwargs['product']
     duedate = kwargs['duedate']
     grocycode = kwargs['grocycode']
 
-
     # prepare grocycode datamatrix
     from pylibdmtx.pylibdmtx import encode
-    encoded = encode(grocycode.encode('utf8'), size="SquareAuto") # adjusted for 300x300 dpi - results in DM code roughly 5x5mm
+    encoded = encode(grocycode.encode('utf8'), size="SquareAuto")
     datamatrix = Image.frombytes('RGB', (encoded.width, encoded.height), encoded.pixels)
-    datamatrix.save('/tmp/dmtx.png')
 
-    product_font = ImageFont.truetype(kwargs['font_path'], 100)
-    duedate_font = ImageFont.truetype(kwargs['font_path'], 60)
     width = kwargs['width']
-    height = 200
+    height = 200  # fixed height for layout
+
     if kwargs['orientation'] == 'rotated':
-        tw = width
-        width = height
-        height = tw
+        width, height = height, width
 
     im = Image.new('RGB', (width, height), 'white')
     draw = ImageDraw.Draw(im)
-    if kwargs['orientation'] == 'standard':
-        vertical_offset = kwargs['margin_top']
-        horizontal_offset = kwargs['margin_left']
-    elif kwargs['orientation'] == 'rotated':
-        vertical_offset = kwargs['margin_top']
-        horizontal_offset = kwargs['margin_left']
-        datamatrix.transpose(Image.ROTATE_270)
 
-    im.paste(datamatrix, (horizontal_offset, vertical_offset, horizontal_offset + encoded.width, vertical_offset + encoded.height))
+    # --- datamatrix position ---
+    vertical_offset = kwargs['margin_top']
+    horizontal_offset = kwargs['margin_left']
 
-    if kwargs['orientation'] == 'standard':
-        vertical_offset += -10
-        horizontal_offset = encoded.width + 40
-    elif kwargs['orientation'] == 'rotated':
-        vertical_offset += encoded.width + 40
-        horizontal_offset += -10
+    im.paste(
+        datamatrix,
+        (
+            horizontal_offset,
+            vertical_offset,
+            horizontal_offset + encoded.width,
+            vertical_offset + encoded.height
+        )
+    )
 
-    textoffset = horizontal_offset, vertical_offset
+    # ================================
+    #       AUTO-SIZE PRODUCT TEXT
+    # ================================
+    max_product_width = width - (encoded.width + GROCY_PADDING_RIGHT)
+    max_product_height = 120
 
-    draw.text(textoffset, product, kwargs['fill_color'], font=product_font)
+    product_font = autosize_font(
+        product,
+        kwargs['font_path'],
+        max_product_width,
+        max_product_height,
+        starting_size=120
+    )
 
+    prod_x = horizontal_offset + encoded.width + GROCY_PADDING_AFTER_DM
+    prod_y = vertical_offset + GROCY_PRODUCT_VERTICAL_TWEAK
+
+    draw.text(
+        (prod_x, prod_y),
+        product,
+        kwargs['fill_color'],
+        font=product_font
+    )
+
+    # ================================
+    #       AUTO-SIZE DUE DATE
+    # ================================
     if duedate is not None:
-        if kwargs['orientation'] == 'standard':
-            vertical_offset += 110
-            horizontal_offset = kwargs['margin_left']
-        elif kwargs['orientation'] == 'rotated':
-            vertical_offset = kwargs['margin_left']
-            horizontal_offset += 110
-        textoffset = horizontal_offset, vertical_offset
+        max_date_width = width - 50
+        max_date_height = 80
 
-        draw.text(textoffset, duedate, kwargs['fill_color'], font=duedate_font)
+        date_font = autosize_font(
+            duedate,
+            kwargs['font_path'],
+            max_date_width,
+            max_date_height,
+            starting_size=80
+        )
+
+        date_x = kwargs['margin_left']
+        date_y = prod_y + max_date_height + GROCY_DATE_VERTICAL_GAP
+
+        draw.text(
+            (date_x, date_y),
+            duedate,
+            kwargs['fill_color'],
+            font=date_font
+        )
 
     return im
+
 
 @get('/api/preview/text')
 @post('/api/preview/text')
