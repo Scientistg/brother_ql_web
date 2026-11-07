@@ -5,7 +5,7 @@
 This is a web service to print labels on Brother QL label printers.
 """
 
-import sys, logging, random, json, argparse, threading
+import sys, logging, random, json, argparse, threading, os, hmac
 from uuid import uuid4
 from io import BytesIO
 from urllib.parse import quote
@@ -39,6 +39,12 @@ GROCY_CONTINUOUS_LENGTH_MM = CONFIG["grocy_label"].get("continuous_label_length_
 GROCY_REVIEW_BEFORE_PRINT = CONFIG["grocy_label"].get("review_before_print", False)
 PENDING_GROCY_LABELS = {}
 PENDING_GROCY_LABELS_LOCK = threading.Lock()
+HOMEBOX_PRINT_MAX_BYTES = 10 * 1024 * 1024
+HOMEBOX_PRINT_MAX_PIXELS = 20_000_000
+HOMEBOX_PRINT_TOKEN_FILE = os.environ.get(
+    'HOMEBOX_PRINT_TOKEN_FILE',
+    '/run/secrets/homebox_label_printer_token'
+)
 
 
 @route('/')
@@ -418,6 +424,74 @@ def image_to_png_bytes(im):
     im.save(image_buffer, format="PNG")
     image_buffer.seek(0)
     return image_buffer.read()
+
+
+@post('/api/print/homebox')
+def print_homebox():
+    try:
+        with open(HOMEBOX_PRINT_TOKEN_FILE, encoding='utf-8') as token_file:
+            expected_token = token_file.read().strip()
+    except OSError as e:
+        logger.error('Cannot read HomeBox printer token: %s', e)
+        response.status = 503
+        return {'success': False, 'error': 'HomeBox printing is not configured'}
+
+    provided_token = request.get_header('X-Printer-Token', '')
+    if not expected_token or not hmac.compare_digest(provided_token, expected_token):
+        response.status = 401
+        return {'success': False, 'error': 'Unauthorized'}
+
+    if request.content_type != 'image/png':
+        response.status = 415
+        return {'success': False, 'error': 'Expected a PNG image'}
+
+    image_data = request.body.read(HOMEBOX_PRINT_MAX_BYTES + 1)
+    if len(image_data) > HOMEBOX_PRINT_MAX_BYTES:
+        response.status = 413
+        return {'success': False, 'error': 'PNG image exceeds the 10 MiB limit'}
+
+    try:
+        with Image.open(BytesIO(image_data)) as uploaded_image:
+            if uploaded_image.format != 'PNG':
+                response.status = 415
+                return {'success': False, 'error': 'Expected a PNG image'}
+            if uploaded_image.width * uploaded_image.height > HOMEBOX_PRINT_MAX_PIXELS:
+                response.status = 413
+                return {'success': False, 'error': 'PNG image dimensions are too large'}
+            uploaded_image.load()
+            image = uploaded_image.convert('RGB')
+    except (Image.DecompressionBombError, Image.UnidentifiedImageError, OSError, ValueError) as e:
+        response.status = 400
+        return {'success': False, 'error': 'Invalid PNG image: {}'.format(e)}
+
+    label_size = CONFIG['LABEL']['DEFAULT_SIZE']
+    if label_size not in label_sizes:
+        response.status = 500
+        return {'success': False, 'error': 'Configured label size is unavailable'}
+
+    qlr = BrotherQLRaster(CONFIG['PRINTER']['MODEL'])
+    try:
+        create_label(
+            qlr,
+            image,
+            label_size,
+            red='red' in label_size,
+            threshold=70,
+            cut=True,
+            rotate='auto'
+        )
+        if DEBUG:
+            response.status = 503
+            return {'success': False, 'error': 'Printing is disabled in debug mode'}
+        send_to_printer(qlr.data)
+    except Exception as e:
+        logger.exception('HomeBox label printing failed')
+        response.status = 502
+        return {'success': False, 'error': 'Printer rejected the HomeBox label: {}'.format(e)}
+
+    logger.info('Printed HomeBox label (%s, %s x %s dots)', label_size, image.width, image.height)
+    return {'success': True}
+
 
 @post('/api/print/grocy')
 @get('/api/print/grocy')
