@@ -5,8 +5,10 @@
 This is a web service to print labels on Brother QL label printers.
 """
 
-import sys, logging, random, json, argparse
+import sys, logging, random, json, argparse, threading
+from uuid import uuid4
 from io import BytesIO
+from urllib.parse import quote
 
 from bottle import run, route, get, post, response, request, jinja2_view as view, static_file, redirect
 from PIL import Image, ImageDraw, ImageFont
@@ -33,6 +35,10 @@ GROCY_PADDING_RIGHT = CONFIG["grocy_label"]["padding_right"]
 GROCY_PADDING_AFTER_DM = CONFIG["grocy_label"]["padding_after_datamatrix"]
 GROCY_PRODUCT_VERTICAL_TWEAK = CONFIG["grocy_label"]["product_vertical_tweak"]
 GROCY_DATE_VERTICAL_GAP = CONFIG["grocy_label"]["date_vertical_gap"]
+GROCY_CONTINUOUS_LENGTH_MM = CONFIG["grocy_label"].get("continuous_label_length_mm", 13)
+GROCY_REVIEW_BEFORE_PRINT = CONFIG["grocy_label"].get("review_before_print", False)
+PENDING_GROCY_LABELS = {}
+PENDING_GROCY_LABELS_LOCK = threading.Lock()
 
 
 @route('/')
@@ -77,7 +83,7 @@ def get_label_context(request):
       'margin_right':  float(d.get('margin_right',  35))/100.,
       'grocycode': d.get('grocycode', None),
       'product': d.get('product', None),
-      'duedate': d.get('duedate', None)
+      'duedate': d.get('due_date') or d.get('duedate')
     }
     context['margin_top']    = int(context['font_size']*context['margin_top'])
     context['margin_bottom'] = int(context['font_size']*context['margin_bottom'])
@@ -158,8 +164,9 @@ def autosize_font(text, font_path, max_width, max_height, starting_size):
     size = starting_size
     while size > 8:  # minimum readable size
         font = ImageFont.truetype(font_path, size)
-        w, h = font.getsize(text)
-        if w <= max_width and h <= max_height:
+        left, top, right, bottom = font.getbbox(text)
+        w = right - left
+        if w <= max_width and bottom <= max_height:
             return font
         size -= 2
     return ImageFont.truetype(font_path, 8)
@@ -174,11 +181,18 @@ def create_label_grocy(text, **kwargs):
     encoded = encode(grocycode.encode('utf8'), size="SquareAuto")
     datamatrix = Image.frombytes('RGB', (encoded.width, encoded.height), encoded.pixels)
 
-    width = kwargs['width']
-    height = 200  # fixed height for layout
-
-    if kwargs['orientation'] == 'rotated':
-        width, height = height, width
+    label_width = kwargs['width']
+    label_height = kwargs['height']
+    if label_type_specs[kwargs['label_size']]['kind'] == ENDLESS_LABEL:
+        layout_height = 200
+        printable_width = max(label_width, label_height)
+        length_dots = max(1, int(round(GROCY_CONTINUOUS_LENGTH_MM * 300 / 25.4)))
+        width, height = printable_width, length_dots
+        if kwargs['orientation'] == 'rotated':
+            width, height = height, width
+    else:
+        layout_height = label_height
+        width, height = label_width, label_height
 
     im = Image.new('RGB', (width, height), 'white')
     draw = ImageDraw.Draw(im)
@@ -200,8 +214,28 @@ def create_label_grocy(text, **kwargs):
     # ================================
     #       AUTO-SIZE PRODUCT TEXT
     # ================================
-    max_product_width = width - (encoded.width + GROCY_PADDING_RIGHT)
-    max_product_height = 120
+    prod_x = horizontal_offset + encoded.width + GROCY_PADDING_AFTER_DM
+    prod_y = vertical_offset + GROCY_PRODUCT_VERTICAL_TWEAK
+    bottom_margin = max(0, kwargs['margin_bottom'])
+    product_origin_y = max(0, prod_y)
+    if duedate is not None:
+        max_date_height = max(
+            1,
+            min(80, layout_height - product_origin_y - bottom_margin - GROCY_DATE_VERTICAL_GAP)
+        )
+        reserved_date_height = max_date_height + GROCY_DATE_VERTICAL_GAP
+    else:
+        max_date_height = 0
+        reserved_date_height = 0
+
+    max_product_width = max(
+        1,
+        width - horizontal_offset - encoded.width - GROCY_PADDING_AFTER_DM - GROCY_PADDING_RIGHT
+    )
+    max_product_height = max(
+        1,
+        min(120, layout_height - product_origin_y - bottom_margin - reserved_date_height)
+    )
 
     product_font = autosize_font(
         product,
@@ -210,9 +244,6 @@ def create_label_grocy(text, **kwargs):
         max_product_height,
         starting_size=120
     )
-
-    prod_x = horizontal_offset + encoded.width + GROCY_PADDING_AFTER_DM
-    prod_y = vertical_offset + GROCY_PRODUCT_VERTICAL_TWEAK
 
     draw.text(
         (prod_x, prod_y),
@@ -225,9 +256,19 @@ def create_label_grocy(text, **kwargs):
     #       AUTO-SIZE DUE DATE
     # ================================
     if duedate is not None:
-        max_date_width = width - 50
-        max_date_height = 80
+        max_date_width = max(
+            1,
+            width - prod_x - GROCY_PADDING_RIGHT
+        )
 
+        product_bbox = product_font.getbbox(product)
+        product_text_height = product_bbox[3] - product_bbox[1]
+        date_x = prod_x
+        date_y = prod_y + product_text_height + GROCY_DATE_VERTICAL_GAP
+        max_date_height = max(
+            1,
+            min(max_date_height, height - date_y)
+        )
         date_font = autosize_font(
             duedate,
             kwargs['font_path'],
@@ -235,9 +276,6 @@ def create_label_grocy(text, **kwargs):
             max_date_height,
             starting_size=80
         )
-
-        date_x = kwargs['margin_left']
-        date_y = prod_y + max_date_height + GROCY_DATE_VERTICAL_GAP
 
         draw.text(
             (date_x, date_y),
@@ -247,6 +285,118 @@ def create_label_grocy(text, **kwargs):
         )
 
     return im
+
+
+def build_grocy_print_data(context):
+    im = create_label_grocy(**context)
+    if context['kind'] == ENDLESS_LABEL:
+        rotate = 0 if context['orientation'] == 'standard' else 90
+    elif context['kind'] in (ROUND_DIE_CUT_LABEL, DIE_CUT_LABEL):
+        rotate = 'auto'
+
+    qlr = BrotherQLRaster(CONFIG['PRINTER']['MODEL'])
+    red = 'red' in context['label_size']
+    create_label(
+        qlr,
+        im,
+        context['label_size'],
+        red=red,
+        threshold=context['threshold'],
+        cut=True,
+        rotate=rotate
+    )
+
+    preview_im = im
+    if context['kind'] == ENDLESS_LABEL and rotate not in ('auto', 0):
+        preview_im = im.rotate(rotate, expand=True)
+    elif context['kind'] in (ROUND_DIE_CUT_LABEL, DIE_CUT_LABEL) and rotate == 'auto':
+        label_width, label_height = label_type_specs[context['label_size']]['dots_printable']
+        if im.size == (label_height, label_width):
+            preview_im = im.rotate(90, expand=True)
+
+    return preview_im, qlr.data
+
+
+def send_to_printer(data):
+    be = BACKEND_CLASS(CONFIG['PRINTER']['PRINTER'])
+    try:
+        be.write(data)
+    finally:
+        be.dispose()
+
+
+def grocy_job_details(job):
+    width_mm = job['image'].width * 25.4 / 300
+    height_mm = job['image'].height * 25.4 / 300
+    return {
+        'id': job['id'],
+        'product': job['product'],
+        'duedate': job['duedate'],
+        'label_size': job['label_size'],
+        'width': job['image'].width,
+        'height': job['image'].height,
+        'width_mm': round(width_mm, 1),
+        'height_mm': round(height_mm, 1)
+    }
+
+
+@get('/grocy/review')
+@view('grocy_review.jinja2')
+def grocy_review():
+    with PENDING_GROCY_LABELS_LOCK:
+        jobs = [grocy_job_details(job) for job in PENDING_GROCY_LABELS.values()]
+    return {
+        'website': CONFIG['WEBSITE'],
+        'jobs': jobs,
+        'message': request.query.get('message')
+    }
+
+
+@get('/api/grocy/review/<job_id>/preview')
+def preview_grocy_job(job_id):
+    with PENDING_GROCY_LABELS_LOCK:
+        job = PENDING_GROCY_LABELS.get(job_id)
+        if job is None:
+            response.status = 404
+            return 'Pending label not found'
+        image_data = job['image_data']
+    response.set_header('Content-type', 'image/png')
+    return image_data
+
+
+@post('/grocy/review/<job_id>/print')
+def print_grocy_job(job_id):
+    with PENDING_GROCY_LABELS_LOCK:
+        job = PENDING_GROCY_LABELS.get(job_id)
+        if job is None:
+            return redirect('/grocy/review?message=Pending%20label%20not%20found')
+        if job['printing']:
+            return redirect('/grocy/review?message=This%20label%20is%20already%20printing')
+        if DEBUG:
+            return redirect('/grocy/review?message=Debug%20mode%20is%20preventing%20printing')
+        job['printing'] = True
+
+    try:
+        send_to_printer(job['raster_data'])
+    except Exception as e:
+        with PENDING_GROCY_LABELS_LOCK:
+            job['printing'] = False
+        logger.warning('Exception happened: %s', e)
+        return redirect('/grocy/review?message=' + quote('Printing failed: {}'.format(e)))
+
+    with PENDING_GROCY_LABELS_LOCK:
+        PENDING_GROCY_LABELS.pop(job_id, None)
+    return redirect('/grocy/review?message=Label%20printed')
+
+
+@post('/grocy/review/<job_id>/discard')
+def discard_grocy_job(job_id):
+    with PENDING_GROCY_LABELS_LOCK:
+        job = PENDING_GROCY_LABELS.get(job_id)
+        if job is not None and job['printing']:
+            return redirect('/grocy/review?message=This%20label%20is%20already%20printing')
+        PENDING_GROCY_LABELS.pop(job_id, None)
+    return redirect('/grocy/review?message=Label%20discarded')
 
 
 @get('/api/preview/text')
@@ -278,6 +428,7 @@ def print_grocy():
     returns; JSON
     """
 
+    logger.debug("Grocy label request payload: %r", dict(request.params.decode()))
     return_dict = {'success' : False }
 
     try:
@@ -290,33 +441,40 @@ def print_grocy():
         return_dict['error'] = 'Please provide the product for the label'
         return return_dict
 
-    im = create_label_grocy(**context)
-    if DEBUG: im.save('sample-out.png')
+    im, raster_data = build_grocy_print_data(context)
+    if DEBUG:
+        im.save('sample-out.png')
 
-    if context['kind'] == ENDLESS_LABEL:
-        rotate = 0 if context['orientation'] == 'standard' else 90
-    elif context['kind'] in (ROUND_DIE_CUT_LABEL, DIE_CUT_LABEL):
-        rotate = 'auto'
-
-    qlr = BrotherQLRaster(CONFIG['PRINTER']['MODEL'])
-    red = False
-    if 'red' in context['label_size']:
-        red = True
-    create_label(qlr, im, context['label_size'], red=red, threshold=context['threshold'], cut=True, rotate=rotate)
+    if GROCY_REVIEW_BEFORE_PRINT:
+        job_id = uuid4().hex
+        job = {
+            'id': job_id,
+            'product': context['product'],
+            'duedate': context['duedate'],
+            'label_size': context['label_size'],
+            'image': im,
+            'image_data': image_to_png_bytes(im),
+            'raster_data': raster_data,
+            'printing': False
+        }
+        with PENDING_GROCY_LABELS_LOCK:
+            PENDING_GROCY_LABELS[job_id] = job
+        return {
+            'success': True,
+            'queued': True,
+            'review_url': '/grocy/review'
+        }
 
     if not DEBUG:
         try:
-            be = BACKEND_CLASS(CONFIG['PRINTER']['PRINTER'])
-            be.write(qlr.data)
-            be.dispose()
-            del be
+            send_to_printer(raster_data)
         except Exception as e:
             return_dict['message'] = str(e)
             logger.warning('Exception happened: %s', e)
             return return_dict
 
     return_dict['success'] = True
-    if DEBUG: return_dict['data'] = str(qlr.data)
+    if DEBUG: return_dict['data'] = str(raster_data)
     return return_dict
 
 @post('/api/print/text')

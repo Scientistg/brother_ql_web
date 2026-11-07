@@ -34,6 +34,12 @@ fontconfig using [`brew install fontconfig`](http://brewformulas.org/Fontconfig)
 
 Copy `config.example.json` to `config.json` (e.g. `cp config.example.json config.json`) and adjust the values to match your needs.
 
+To review Grocy labels in the printer service before printing, add `"review_before_print": true` inside the `grocy_label` section of `config.json`. Grocy requests are then queued at `/grocy/review`; each label can be printed or discarded there. Set the option to `false` (or omit it) to restore immediate printing. Pending labels are held in memory and are cleared if the service restarts.
+
+The Grocy print endpoint accepts Grocy's `due_date` field for the best-before date. The older `duedate` parameter remains supported for existing callers.
+
+Continuous-tape Grocy labels use a 13 mm label length by default. Set `grocy_label.continuous_label_length_mm` in `config.json` to adjust the length.
+
 ### Startup
 
 To start the server, run `./brother_ql_web.py`. The command line parameters overwrite the values configured in `config.json`. Here's its command line interface:

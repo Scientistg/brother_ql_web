@@ -1,0 +1,45 @@
+{% extends "base.jinja2" %}
+
+{% block page_title %}Grocy Label Review{% endblock %}
+
+{% block jumbotron %}
+  <h1>Grocy Label Review</h1>
+  <p>Review incoming Grocy labels before sending them to the printer.</p>
+{% endblock %}
+
+{% block content %}
+  {% if message %}
+  <div class="alert alert-info" role="alert">{{ message }}</div>
+  {% endif %}
+
+  {% if jobs %}
+    {% for job in jobs %}
+    <div class="panel panel-default">
+      <div class="panel-heading">
+        <strong>{{ job['product'] }}</strong>
+        {% if job['duedate'] %}<span> — {{ job['duedate'] }}</span>{% endif %}
+      </div>
+      <div class="panel-body">
+        <p>Stock: {{ job['label_size'] }} · Rendered size: {{ job['width_mm'] }} × {{ job['height_mm'] }} mm ({{ job['width'] }} × {{ job['height'] }} dots at 300 dpi)</p>
+        <img
+          src="/api/grocy/review/{{ job['id'] }}/preview"
+          alt="Preview of {{ job['product'] }}"
+          style="border: 1px solid #444; max-width: 100%; max-height: 350px; width: auto; height: auto; margin-bottom: 10px;"
+        >
+        <div class="clearfix">
+          <form method="post" action="/grocy/review/{{ job['id'] }}/print" style="display: inline-block; margin-right: 8px;">
+            <button type="submit" class="btn btn-primary">
+              <span class="glyphicon glyphicon-print" aria-hidden="true"></span> Print
+            </button>
+          </form>
+          <form method="post" action="/grocy/review/{{ job['id'] }}/discard" style="display: inline-block;">
+            <button type="submit" class="btn btn-default">Discard</button>
+          </form>
+        </div>
+      </div>
+    </div>
+    {% endfor %}
+  {% else %}
+    <div class="alert alert-info" role="alert">No Grocy labels are waiting for review.</div>
+  {% endif %}
+{% endblock %}
